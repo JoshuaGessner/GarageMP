@@ -8,6 +8,13 @@
 # Build and release artifacts
 dist/
 
+# Development-only project docs and tooling
+PLAN.md
+TODO.md
+README_GarageMP.md
+scripts/
+Resources/Client/GarageMP/
+
 # Temp files
 *.tmp
 *.swp
