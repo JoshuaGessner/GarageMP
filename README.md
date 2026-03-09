@@ -14,8 +14,8 @@ GarageMP is a BeamMP server/client mod that persists selected players' vehicles 
 1. Stop your BeamMP server.
 2. Copy this repository's `Resources/` folder into your server root directory.
 3. Confirm these paths exist:
-	- `Resources/Server/GarageMP/main.lua`
-	- `Resources/Client/GarageMP.zip`
+   - `Resources/Server/GarageMP/main.lua`
+   - `Resources/Client/GarageMP.zip`
 4. Start the server.
 
 ## First-Time Setup
@@ -29,6 +29,7 @@ GarageMP is a BeamMP server/client mod that persists selected players' vehicles 
 
 - `/garagemp help`
 - `/garagemp status`
+- `/garagemp limits`
 - `/garagemp add <playerName>`
 - `/garagemp remove <playerName>`
 - `/garagemp list`
@@ -48,8 +49,8 @@ Optional alias:
 1. Stop server.
 2. Backup `Resources/Server/GarageMP/data/`.
 3. Replace:
-	- `Resources/Server/GarageMP/main.lua`
-	- `Resources/Client/GarageMP.zip`
+   - `Resources/Server/GarageMP/main.lua`
+   - `Resources/Client/GarageMP.zip`
 4. Keep existing `data/` files.
 5. Start server and validate with `/garagemp info`.
 
@@ -63,6 +64,7 @@ Key settings:
 
 - `autoSaveIntervalMs`
 - `maxVehiclesPerPlayer`
+- `serverMaxCarsPerPlayer` (set this to your BeamMP `MaxCars` value)
 - `commandPrefix`
 - `excludeGuestsAsHosts`
 - `spawnMaxRetries`
@@ -77,3 +79,5 @@ Key settings:
 ## Known Limitation
 
 BeamMP cannot keep vehicles physically spawned when zero clients are connected. GarageMP persists vehicles and restores/re-hosts them when suitable clients are online.
+
+When there is not enough live vehicle capacity across connected proxy hosts, GarageMP keeps as many vehicles synced as possible and queues the overflow. Queued overflow stays in persisted files and is restored on owner login or when proxy capacity becomes available.

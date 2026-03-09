@@ -10,6 +10,7 @@ local DEFAULT_CONFIG = {
     settings = {
         autoSaveIntervalMs = 300000,
         maxVehiclesPerPlayer = 5,
+        serverMaxCarsPerPlayer = 0,
         commandPrefix = "/garagemp",
         excludeGuestsAsHosts = true,
         spawnMaxRetries = 3,
@@ -31,11 +32,14 @@ local retryQueue = {} -- requestId -> {dueAt, request}
 local pendingRemoveRequests = {} -- requestId -> remove request state
 local removeRetryQueue = {} -- requestId -> {dueAt, request}
 local offlineQueue = {} -- ownerBeammpID -> true
+local syncQueue = {} -- ownerBeammpID -> array {slot, vehicle}
+local pendingReservations = {} -- hostPid -> reserved spawn count
 local dirtyOwners = {} -- beammpID -> true
 local configDirty = false
 local requestCounter = 0
 local parseAckPayload
 local getRequestItemBySlot
+local tryDrainOfflineQueue
 
 local function log(...)
     print(GARAGEMP_PREFIX, ...)
@@ -77,6 +81,183 @@ local function setToArray(tbl)
     end
     table.sort(result)
     return result
+end
+
+local function ownerQueueCount(ownerBeammpID)
+    local q = syncQueue[tostring(ownerBeammpID)]
+    if type(q) ~= "table" then
+        return 0
+    end
+    return #q
+end
+
+local function basePerPlayerCap()
+    local cap = tonumber(config.settings.maxVehiclesPerPlayer) or 5
+    if cap < 1 then
+        cap = 1
+    end
+    return math.floor(cap)
+end
+
+local function effectivePerPlayerCap()
+    local cap = basePerPlayerCap()
+    local serverCap = tonumber(config.settings.serverMaxCarsPerPlayer) or 0
+    if serverCap >= 1 then
+        serverCap = math.floor(serverCap)
+        if serverCap < cap then
+            cap = serverCap
+        end
+    end
+    return cap
+end
+
+local function trimOwnerVehicles(ownerBeammpID, reason)
+    ownerBeammpID = tostring(ownerBeammpID)
+    local list = savedVehicles[ownerBeammpID]
+    if type(list) ~= "table" then
+        savedVehicles[ownerBeammpID] = {}
+        return false
+    end
+
+    local cap = effectivePerPlayerCap()
+    if #list <= cap then
+        return false
+    end
+
+    local trimmed = {}
+    for i = 1, cap do
+        table.insert(trimmed, list[i])
+    end
+    savedVehicles[ownerBeammpID] = trimmed
+    dirtyOwners[ownerBeammpID] = true
+    log("Trimmed owner", ownerBeammpID, "from", #list, "to", #trimmed, "vehicles", "reason", tostring(reason or "cap"))
+    return true
+end
+
+local function countPlayerVehicles(pid)
+    local rawVehicles = MP.GetPlayerVehicles(pid)
+    if type(rawVehicles) ~= "table" then
+        return 0
+    end
+    local count = 0
+    for _, _ in pairs(rawVehicles) do
+        count = count + 1
+    end
+    return count
+end
+
+local function hasVehicle(pid, vid)
+    local rawVehicles = MP.GetPlayerVehicles(pid)
+    if type(rawVehicles) ~= "table" then
+        return false
+    end
+    local needle = tostring(vid)
+    for existingVid, _ in pairs(rawVehicles) do
+        if tostring(existingVid) == needle then
+            return true
+        end
+    end
+    return false
+end
+
+local function reserveSlots(pid, amount)
+    pid = normalizePid(pid)
+    local n = tonumber(amount) or 0
+    if not pid or n <= 0 then
+        return
+    end
+    pendingReservations[pid] = (pendingReservations[pid] or 0) + n
+end
+
+local function releaseSlots(pid, amount)
+    pid = normalizePid(pid)
+    local n = tonumber(amount) or 0
+    if not pid or n <= 0 then
+        return
+    end
+    local remaining = (pendingReservations[pid] or 0) - n
+    if remaining <= 0 then
+        pendingReservations[pid] = nil
+    else
+        pendingReservations[pid] = remaining
+    end
+end
+
+local function availableSlotsForPid(pid)
+    local cap = effectivePerPlayerCap()
+    local live = countPlayerVehicles(pid)
+    local reserved = pendingReservations[pid] or 0
+    local available = cap - live - reserved
+    if available < 0 then
+        available = 0
+    end
+    return available
+end
+
+local function queueSyncItems(ownerBeammpID, items)
+    ownerBeammpID = tostring(ownerBeammpID)
+    if type(items) ~= "table" or #items == 0 then
+        return
+    end
+
+    local existing = syncQueue[ownerBeammpID] or {}
+    local bySlot = {}
+    for _, item in ipairs(existing) do
+        bySlot[tostring(item.slot)] = item
+    end
+    for _, item in ipairs(items) do
+        if item and item.vehicle ~= nil then
+            bySlot[tostring(item.slot)] = {
+                slot = item.slot,
+                vehicle = item.vehicle,
+            }
+        end
+    end
+
+    local merged = {}
+    for _, item in pairs(bySlot) do
+        table.insert(merged, item)
+    end
+    table.sort(merged, function(a, b)
+        local sa = tonumber(a.slot)
+        local sb = tonumber(b.slot)
+        if sa and sb then
+            return sa < sb
+        end
+        return tostring(a.slot) < tostring(b.slot)
+    end)
+    syncQueue[ownerBeammpID] = merged
+    offlineQueue[ownerBeammpID] = true
+end
+
+local function replaceSyncQueue(ownerBeammpID, items)
+    ownerBeammpID = tostring(ownerBeammpID)
+    local nextQueue = {}
+    if type(items) == "table" then
+        for _, item in ipairs(items) do
+            if item and item.vehicle ~= nil then
+                table.insert(nextQueue, {
+                    slot = item.slot,
+                    vehicle = item.vehicle,
+                })
+            end
+        end
+    end
+    table.sort(nextQueue, function(a, b)
+        local sa = tonumber(a.slot)
+        local sb = tonumber(b.slot)
+        if sa and sb then
+            return sa < sb
+        end
+        return tostring(a.slot) < tostring(b.slot)
+    end)
+    if #nextQueue == 0 then
+        syncQueue[ownerBeammpID] = nil
+        offlineQueue[ownerBeammpID] = nil
+    else
+        syncQueue[ownerBeammpID] = nextQueue
+        offlineQueue[ownerBeammpID] = true
+    end
 end
 
 local function readText(path)
@@ -247,6 +428,7 @@ local function loadPlayerVehicles(beammpID)
         return
     end
     savedVehicles[tostring(beammpID)] = decoded.vehicles
+    trimOwnerVehicles(beammpID, "load")
     dirtyOwners[tostring(beammpID)] = nil
 end
 
@@ -314,10 +496,12 @@ local function upsertVehicle(ownerBeammpID, vehicle)
         local existingKey = tostring((existing.meta and existing.meta.ownerVid) or "")
         if key ~= "" and existingKey == key then
             list[idx] = vehicle
+            trimOwnerVehicles(ownerBeammpID, "upsert-update")
             return
         end
     end
     table.insert(list, vehicle)
+    trimOwnerVehicles(ownerBeammpID, "upsert-insert")
     markOwnerDirty(ownerBeammpID)
 end
 
@@ -341,7 +525,7 @@ end
 local function snapshotOwnerVehicles(pid, ownerBeammpID)
     local rawVehicles = MP.GetPlayerVehicles(pid)
     local result = {}
-    local maxVehicles = tonumber(config.settings.maxVehiclesPerPlayer) or 5
+    local maxVehicles = effectivePerPlayerCap()
 
     for vid, rawData in pairs(rawVehicles) do
         if #result >= maxVehicles then
@@ -371,6 +555,7 @@ local function snapshotOwnerVehicles(pid, ownerBeammpID)
     end
 
     savedVehicles[tostring(ownerBeammpID)] = result
+    replaceSyncQueue(ownerBeammpID, {})
     markOwnerDirty(ownerBeammpID)
     savePlayerVehicles(ownerBeammpID)
 end
@@ -401,14 +586,19 @@ local function hostLoad(pid)
     return count
 end
 
-local function sortHostsLeastLoaded(hosts)
+local function sortHostsByAvailability(hosts)
     table.sort(hosts, function(a, b)
-        local la = hostLoad(a)
-        local lb = hostLoad(b)
-        if la == lb then
-            return a < b
+        local aa = availableSlotsForPid(a)
+        local ab = availableSlotsForPid(b)
+        if aa == ab then
+            local la = hostLoad(a)
+            local lb = hostLoad(b)
+            if la == lb then
+                return a < b
+            end
+            return la < lb
         end
-        return la < lb
+        return aa > ab
     end)
 end
 
@@ -560,6 +750,7 @@ local function scheduleRetry(request, reason)
         if request.kind == "restore" then
             pendingRestore[tostring(request.ownerBeammpID)] = nil
         else
+            queueSyncItems(request.ownerBeammpID, request.items)
             queueOwnerForLater(request.ownerBeammpID)
         end
         return
@@ -582,6 +773,48 @@ local function scheduleRetry(request, reason)
 end
 
 local function sendSpawnBatch(request)
+    local totalItems = #(request.items or {})
+    if totalItems == 0 then
+        return false
+    end
+
+    local available = availableSlotsForPid(request.hostPid)
+    if available <= 0 then
+        if request.kind == "proxy" then
+            queueSyncItems(request.ownerBeammpID, request.items)
+            log("No host capacity for proxy dispatch; queued", totalItems, "owner", tostring(request.ownerBeammpID), "host", tostring(request.hostPid))
+            return false
+        end
+        pendingRestore[tostring(request.ownerBeammpID)] = nil
+        log("No owner capacity for restore dispatch; deferred to saved state owner", tostring(request.ownerBeammpID), "pid", tostring(request.hostPid))
+        return false
+    end
+
+    if available < totalItems then
+        local allowed = {}
+        local overflow = {}
+        for idx, item in ipairs(request.items) do
+            if idx <= available then
+                table.insert(allowed, item)
+            else
+                table.insert(overflow, item)
+            end
+        end
+        request.items = allowed
+        totalItems = #allowed
+        if request.kind == "proxy" and #overflow > 0 then
+            queueSyncItems(request.ownerBeammpID, overflow)
+        elseif request.kind == "restore" and #overflow > 0 then
+            log("Restore overflow kept on file for owner", tostring(request.ownerBeammpID), "count", #overflow)
+        end
+    end
+
+    if totalItems == 0 then
+        return false
+    end
+
+    reserveSlots(request.hostPid, totalItems)
+    request.reservedSlots = totalItems
     pendingRequests[request.requestId] = request
     local payload = {
         requestId = request.requestId,
@@ -591,6 +824,7 @@ local function sendSpawnBatch(request)
     }
     local ok, err = MP.TriggerClientEventJson(request.hostPid, "GarageMP_SpawnBatch", payload)
     if not ok then
+        releaseSlots(request.hostPid, request.reservedSlots or 0)
         pendingRequests[request.requestId] = nil
         log("Failed to send spawn batch to", request.hostPid, err)
         scheduleRetry(request, err)
@@ -615,7 +849,9 @@ local function onRetryTick()
         if envelope and envelope.request then
             local req = envelope.request
             if MP.IsPlayerConnected(req.hostPid) then
-                sendSpawnBatch(req)
+                if not sendSpawnBatch(req) and req.kind == "proxy" then
+                    queueOwnerForLater(req.ownerBeammpID)
+                end
             else
                 if req.kind == "restore" then
                     pendingRestore[tostring(req.ownerBeammpID)] = nil
@@ -668,46 +904,107 @@ local function onRetryTick()
             end
         end
     end
+
+    tryDrainOfflineQueue()
 end
 
-local function spawnOwnerOnHosts(ownerBeammpID, excludePid)
-    local vehicles = savedVehicles[tostring(ownerBeammpID)] or {}
-    if #vehicles == 0 then
+local function spawnOwnerOnHosts(ownerBeammpID, excludePid, options)
+    ownerBeammpID = tostring(ownerBeammpID)
+    options = options or {}
+    local rebuild = options.rebuild ~= false
+
+    local sourceItems = {}
+    if rebuild then
+        trimOwnerVehicles(ownerBeammpID, "proxy-rebuild")
+        local vehicles = savedVehicles[ownerBeammpID] or {}
+        for i, vehicle in ipairs(vehicles) do
+            table.insert(sourceItems, {
+                slot = i,
+                vehicle = vehicle,
+            })
+        end
+        clearOwnerProxyAssignments(ownerBeammpID)
+    else
+        local queued = syncQueue[ownerBeammpID] or {}
+        for _, item in ipairs(queued) do
+            table.insert(sourceItems, {
+                slot = item.slot,
+                vehicle = item.vehicle,
+            })
+        end
+    end
+
+    if #sourceItems == 0 then
+        replaceSyncQueue(ownerBeammpID, {})
         return
     end
 
     local hosts = getConnectedEligibleHosts(excludePid)
     if #hosts == 0 then
+        replaceSyncQueue(ownerBeammpID, sourceItems)
         queueOwnerForLater(ownerBeammpID)
         return
     end
 
-    sortHostsLeastLoaded(hosts)
-    clearOwnerProxyAssignments(ownerBeammpID)
-
-    local batches = {}
-    for i, vehicle in ipairs(vehicles) do
-        local hostPid = hosts[((i - 1) % #hosts) + 1]
-        batches[hostPid] = batches[hostPid] or {}
-        table.insert(batches[hostPid], {
-            slot = i,
-            vehicle = vehicle,
-        })
+    sortHostsByAvailability(hosts)
+    local hostSlots = {}
+    for _, hostPid in ipairs(hosts) do
+        hostSlots[hostPid] = availableSlotsForPid(hostPid)
     end
 
+    local batches = {}
+    local remaining = {}
+    local hostIndex = 1
+    local hostCount = #hosts
+
+    for _, item in ipairs(sourceItems) do
+        local assigned = false
+        local attempts = 0
+        while attempts < hostCount do
+            local hostPid = hosts[hostIndex]
+            if hostSlots[hostPid] and hostSlots[hostPid] > 0 then
+                batches[hostPid] = batches[hostPid] or {}
+                table.insert(batches[hostPid], item)
+                hostSlots[hostPid] = hostSlots[hostPid] - 1
+                assigned = true
+                hostIndex = (hostIndex % hostCount) + 1
+                break
+            end
+            hostIndex = (hostIndex % hostCount) + 1
+            attempts = attempts + 1
+        end
+        if not assigned then
+            table.insert(remaining, item)
+        end
+    end
+
+    replaceSyncQueue(ownerBeammpID, remaining)
+
+    local dispatched = 0
     for hostPid, items in pairs(batches) do
         local request = {
             requestId = nextRequestId(),
             kind = "proxy",
-            ownerBeammpID = tostring(ownerBeammpID),
+            ownerBeammpID = ownerBeammpID,
             hostPid = hostPid,
             items = items,
             retries = 0,
             ts = nowSec(),
         }
-        sendSpawnBatch(request)
+        if sendSpawnBatch(request) then
+            dispatched = dispatched + #items
+        else
+            queueSyncItems(ownerBeammpID, items)
+        end
     end
-    log("Assigned owner", tostring(ownerBeammpID), "vehicles", #vehicles, "across hosts", #hosts)
+
+    if ownerQueueCount(ownerBeammpID) > 0 then
+        queueOwnerForLater(ownerBeammpID)
+    else
+        offlineQueue[ownerBeammpID] = nil
+    end
+
+    log("Assigned owner", ownerBeammpID, "proxied", dispatched, "queued", ownerQueueCount(ownerBeammpID), "hosts", #hosts)
 end
 
 local function findOnlinePidByBeammpID(beammpID)
@@ -721,16 +1018,29 @@ end
 
 local function restoreOwnerVehicles(pid, ownerBeammpID)
     local startedAt = nowSec()
-    local vehicles = savedVehicles[tostring(ownerBeammpID)] or {}
+    ownerBeammpID = tostring(ownerBeammpID)
+    trimOwnerVehicles(ownerBeammpID, "restore")
+    local vehicles = savedVehicles[ownerBeammpID] or {}
     removeProxyVehiclesForOwner(ownerBeammpID)
 
     if #vehicles == 0 then
+        pendingRestore[ownerBeammpID] = nil
         return
     end
 
-    pendingRestore[tostring(ownerBeammpID)] = true
+    pendingRestore[ownerBeammpID] = true
     local items = {}
+    local available = availableSlotsForPid(pid)
+    if available <= 0 then
+        pendingRestore[ownerBeammpID] = nil
+        log("Restore skipped due to zero available owner slots", ownerBeammpID, "pid", tostring(pid))
+        return
+    end
+
     for i, vehicle in ipairs(vehicles) do
+        if #items >= available then
+            break
+        end
         table.insert(items, { slot = i, vehicle = vehicle })
     end
 
@@ -748,11 +1058,11 @@ local function restoreOwnerVehicles(pid, ownerBeammpID)
     if not ok then
         log("Restore request queued for retry for owner", tostring(ownerBeammpID))
     else
-        log("Restore dispatch for owner", tostring(ownerBeammpID), "to pid", pid, "vehicles", #vehicles, "elapsedSec", nowSec() - startedAt)
+        log("Restore dispatch for owner", tostring(ownerBeammpID), "to pid", pid, "vehicles", #items, "elapsedSec", nowSec() - startedAt)
     end
 end
 
-local function tryDrainOfflineQueue()
+tryDrainOfflineQueue = function()
     for ownerBeammpID, queued in pairs(offlineQueue) do
         if queued then
             local ownerPid = findOnlinePidByBeammpID(ownerBeammpID)
@@ -762,8 +1072,8 @@ local function tryDrainOfflineQueue()
             else
                 local hosts = getConnectedEligibleHosts(-1)
                 if #hosts > 0 then
-                    offlineQueue[ownerBeammpID] = nil
-                    spawnOwnerOnHosts(ownerBeammpID, -1)
+                    local hasQueue = ownerQueueCount(ownerBeammpID) > 0
+                    spawnOwnerOnHosts(ownerBeammpID, -1, { rebuild = not hasQueue })
                 end
             end
         end
@@ -816,6 +1126,7 @@ local function onSpawnComplete(senderPid, rawData)
     if not req then
         return
     end
+    releaseSlots(req.hostPid, req.reservedSlots or #(req.items or {}))
 
     local ownerBeammpID = tostring(req.ownerBeammpID)
     if req.kind == "proxy" then
@@ -826,8 +1137,11 @@ local function onSpawnComplete(senderPid, rawData)
     if type(ack.results) == "table" then
         for _, item in ipairs(ack.results) do
             local success = item.success == true
+            local hostVid = normalizePid(item.hostVid) or item.hostVid
+            if success and not hasVehicle(senderPid, hostVid) then
+                success = false
+            end
             if success and req.kind == "proxy" then
-                local hostVid = normalizePid(item.hostVid) or item.hostVid
                 local slot = normalizePid(item.slot) or item.slot
                 table.insert(proxyAssignments[ownerBeammpID], {
                     hostPid = senderPid,
@@ -853,14 +1167,26 @@ local function onSpawnComplete(senderPid, rawData)
             end
         end
         if #retryItems > 0 then
-            scheduleRetry({
-                kind = req.kind,
-                ownerBeammpID = ownerBeammpID,
-                hostPid = req.hostPid,
-                items = retryItems,
-                retries = req.retries,
-            }, "spawn ack had failed items")
-            log("Spawn ack had", #retryItems, "failed item(s), retry scheduled for owner", ownerBeammpID)
+            if req.kind == "proxy" then
+                queueSyncItems(ownerBeammpID, retryItems)
+                scheduleRetry({
+                    kind = req.kind,
+                    ownerBeammpID = ownerBeammpID,
+                    hostPid = req.hostPid,
+                    items = retryItems,
+                    retries = req.retries,
+                }, "spawn ack had failed items")
+                log("Spawn ack had", #retryItems, "failed proxy item(s), queued + retry scheduled for owner", ownerBeammpID)
+            else
+                scheduleRetry({
+                    kind = req.kind,
+                    ownerBeammpID = ownerBeammpID,
+                    hostPid = req.hostPid,
+                    items = retryItems,
+                    retries = req.retries,
+                }, "spawn ack had failed restore items")
+                log("Spawn ack had", #retryItems, "failed restore item(s), retry scheduled for owner", ownerBeammpID)
+            end
         end
     end
 
@@ -880,6 +1206,13 @@ local function onSpawnComplete(senderPid, rawData)
             markOwnerDirty(ownerBeammpID)
         end
         pendingRestore[ownerBeammpID] = nil
+    end
+    if req.kind == "proxy" then
+        if ownerQueueCount(ownerBeammpID) > 0 then
+            queueOwnerForLater(ownerBeammpID)
+        else
+            offlineQueue[ownerBeammpID] = nil
+        end
     end
     pendingRequests[tostring(ack.requestId)] = nil
 end
@@ -925,6 +1258,21 @@ local function onPlayerDisconnect(pid)
     pid = normalizePid(pid)
     if not pid then
         return
+    end
+
+    pendingReservations[pid] = nil
+    local droppedRequestIds = {}
+    for requestId, req in pairs(pendingRequests) do
+        if req.hostPid == pid then
+            table.insert(droppedRequestIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(droppedRequestIds) do
+        local req = pendingRequests[requestId]
+        pendingRequests[requestId] = nil
+        if req then
+            scheduleRetry(req, "host disconnected before spawn ack")
+        end
     end
 
     local bid = playerToBeammpID[pid] or getBeammpID(pid)
@@ -1001,6 +1349,9 @@ local function onVehicleDeleted(pid, vid)
     local proxyOwner = proxyIndex[keyPidVid(pid, vid)]
     if proxyOwner then
         proxyIndex[keyPidVid(pid, vid)] = nil
+        if ownerQueueCount(proxyOwner) > 0 then
+            spawnOwnerOnHosts(proxyOwner, -1, { rebuild = false })
+        end
         return
     end
 
@@ -1008,6 +1359,8 @@ local function onVehicleDeleted(pid, vid)
     if bid and isPersistEnabled(bid) then
         removeVehicleByOwnerVid(bid, vid)
     end
+
+    tryDrainOfflineQueue()
 end
 
 local function onVehicleReset(pid, vid, data)
@@ -1034,7 +1387,7 @@ local function onVehicleReset(pid, vid, data)
 end
 
 local function sendHelp(pid)
-    MP.SendChatMessage(pid, "GarageMP commands: /garagemp help|status|add|remove|list|save|clear|addadmin|removeadmin|info|proxyclear|setup")
+    MP.SendChatMessage(pid, "GarageMP commands: /garagemp help|status|limits|add|remove|list|save|clear|addadmin|removeadmin|info|proxyclear|setup")
 end
 
 local function resolveCommand(message)
@@ -1077,6 +1430,12 @@ local function onChatMessage(pid, name, message)
             count = #savedVehicles[bid]
         end
         MP.SendChatMessage(pid, "GarageMP status: enabled=" .. tostring(enabled) .. ", savedVehicles=" .. tostring(count))
+        return 1
+    elseif cmd == "limits" then
+        local cap = basePerPlayerCap()
+        local serverCap = tonumber(config.settings.serverMaxCarsPerPlayer) or 0
+        local effective = effectivePerPlayerCap()
+        MP.SendChatMessage(pid, "GarageMP limits: modCap=" .. tostring(cap) .. ", serverCap=" .. tostring(serverCap) .. ", effectiveCap=" .. tostring(effective))
         return 1
     elseif cmd == "setup" then
         if next(adminSet) ~= nil then
@@ -1124,7 +1483,11 @@ local function onChatMessage(pid, name, message)
                 queued = queued + 1
             end
         end
-        MP.SendChatMessage(pid, "GarageMP info: owners=" .. ownerCount .. ", proxies=" .. activeProxy .. ", queued=" .. queued)
+        local queuedVehicles = 0
+        for _, items in pairs(syncQueue) do
+            queuedVehicles = queuedVehicles + #items
+        end
+        MP.SendChatMessage(pid, "GarageMP info: owners=" .. ownerCount .. ", proxies=" .. activeProxy .. ", queuedOwners=" .. queued .. ", queuedVehicles=" .. queuedVehicles .. ", cap=" .. tostring(effectivePerPlayerCap()))
         return 1
     elseif cmd == "add" or cmd == "remove" or cmd == "clear" or cmd == "addadmin" or cmd == "removeadmin" or cmd == "proxyclear" then
         local targetName = args[2]
