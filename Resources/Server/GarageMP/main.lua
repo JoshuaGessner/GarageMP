@@ -11,7 +11,6 @@ local DEFAULT_CONFIG = {
         autoSaveIntervalMs = 300000,
         maxVehiclesPerPlayer = 5,
         commandPrefix = "/garagemp",
-        allowPvAlias = true,
         excludeGuestsAsHosts = true,
         spawnMaxRetries = 3,
         retryBaseDelayMs = 1500,
@@ -1046,9 +1045,6 @@ local function resolveCommand(message)
     local cp = string.lower(tostring(config.settings.commandPrefix or "/garagemp"))
     if string.sub(lower, 1, #cp) == cp then
         return string.sub(message, #cp + 1)
-    end
-    if config.settings.allowPvAlias and string.sub(lower, 1, 3) == "/pv" then
-        return string.sub(message, 4)
     end
     return nil
 end

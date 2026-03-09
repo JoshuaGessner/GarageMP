@@ -41,7 +41,7 @@ GarageMP is a BeamMP server/client mod that persists selected players' vehicles 
 
 Optional alias:
 
-- `/pv ...` (if enabled in config)
+- No legacy alias is supported. Use `/garagemp ...` for all commands.
 
 ## Update Existing Installation
 
@@ -64,7 +64,6 @@ Key settings:
 - `autoSaveIntervalMs`
 - `maxVehiclesPerPlayer`
 - `commandPrefix`
-- `allowPvAlias`
 - `excludeGuestsAsHosts`
 - `spawnMaxRetries`
 - `retryBaseDelayMs`
