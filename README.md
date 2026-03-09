@@ -40,9 +40,6 @@ GarageMP is a BeamMP server/client mod that persists selected players' vehicles 
 - `/garagemp info`
 - `/garagemp proxyclear <playerName|beammpID>`
 
-Optional alias:
-
-- No legacy alias is supported. Use `/garagemp ...` for all commands.
 
 ## Update Existing Installation
 
