@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Editor/workspace
+.vscode/
+*.code-workspace
+
+# Build and release artifacts
+dist/
+
+# Temp files
+*.tmp
+*.swp
