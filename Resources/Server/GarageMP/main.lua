@@ -12,10 +12,21 @@ local DEFAULT_CONFIG = {
         maxVehiclesPerPlayer = 5,
         serverMaxCarsPerPlayer = 0,
         commandPrefix = "/garagemp",
+        syncMode = "proxy",
         excludeGuestsAsHosts = true,
         spawnMaxRetries = 3,
         retryBaseDelayMs = 1500,
         removeMaxRetries = 2,
+        joinReadyDelaySec = 8,
+        ownerDispatchCooldownSec = 3,
+        maxSyncQueuePerOwner = 64,
+        maxRetryQueueSize = 1024,
+        maxPendingRequestsPerOwner = 24,
+        spawnRequestTimeoutSec = 25,
+        removeRequestTimeoutSec = 20,
+        stateCompactionIntervalSec = 60,
+        enableCircuitBreaker = true,
+        circuitBreakerCooldownSec = 10,
     },
 }
 
@@ -35,11 +46,25 @@ local offlineQueue = {} -- ownerBeammpID -> true
 local syncQueue = {} -- ownerBeammpID -> array {slot, vehicle}
 local pendingReservations = {} -- hostPid -> reserved spawn count
 local dirtyOwners = {} -- beammpID -> true
+local ownerState = {} -- ownerBeammpID -> state string
+local ownerNextDispatchAt = {} -- ownerBeammpID -> epoch sec
+local retryDedupe = {} -- retrySignature -> requestId
+local playerJoinReadyAt = {} -- pid -> epoch sec when safe for client events
+local storageWritable = true
+local lastStorageProbeAt = 0
+local lastStateCompactionAt = 0
+local circuitBreakerUntil = 0
 local configDirty = false
 local requestCounter = 0
 local parseAckPayload
 local getRequestItemBySlot
 local tryDrainOfflineQueue
+local findOnlinePidByBeammpID
+local maxSyncQueuePerOwner
+local openCircuitBreaker
+local isProxyMode
+local normalizeSyncMode
+local applySyncModeTransition
 
 local function log(...)
     print(GARAGEMP_PREFIX, ...)
@@ -81,6 +106,119 @@ local function setToArray(tbl)
     end
     table.sort(result)
     return result
+end
+
+normalizeSyncMode = function(mode)
+    local m = string.lower(tostring(mode or "proxy"))
+    if m == "proxy" or m == "file" then
+        return m
+    end
+    return nil
+end
+
+isProxyMode = function()
+    local mode = normalizeSyncMode(config.settings and config.settings.syncMode)
+    if not mode then
+        return true
+    end
+    return mode == "proxy"
+end
+
+local function currentSyncMode()
+    return normalizeSyncMode(config.settings and config.settings.syncMode) or "proxy"
+end
+
+local function clearProxyDispatchStateForOwner(ownerBeammpID)
+    ownerBeammpID = tostring(ownerBeammpID)
+    syncQueue[ownerBeammpID] = nil
+    offlineQueue[ownerBeammpID] = nil
+    pendingRestore[ownerBeammpID] = nil
+
+    local retryIds = {}
+    for requestId, envelope in pairs(retryQueue) do
+        local req = envelope and envelope.request or nil
+        if req and tostring(req.ownerBeammpID) == ownerBeammpID and tostring(req.kind) == "proxy" then
+            table.insert(retryIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(retryIds) do
+        local req = retryQueue[requestId] and retryQueue[requestId].request or nil
+        if req then
+            local signature = retrySignature(req)
+            if signature and retryDedupe[signature] == requestId then
+                retryDedupe[signature] = nil
+            end
+        end
+        retryQueue[requestId] = nil
+    end
+
+    local pendingIds = {}
+    for requestId, req in pairs(pendingRequests) do
+        if tostring(req.ownerBeammpID) == ownerBeammpID and tostring(req.kind) == "proxy" then
+            table.insert(pendingIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(pendingIds) do
+        local req = pendingRequests[requestId]
+        if req then
+            releaseSlots(req.hostPid, req.reservedSlots or #(req.items or {}))
+        end
+        pendingRequests[requestId] = nil
+    end
+
+    removeProxyVehiclesForOwner(ownerBeammpID)
+    clearOwnerProxyAssignments(ownerBeammpID)
+    setOwnerState(ownerBeammpID, "file-only")
+end
+
+local function enqueueOfflinePersistOwnersForProxy()
+    for ownerBeammpID, enabled in pairs(persistListSet) do
+        if enabled then
+            local ownerPid = findOnlinePidByBeammpID(ownerBeammpID)
+            if not ownerPid then
+                queueOwnerForLater(ownerBeammpID)
+            end
+        end
+    end
+end
+
+applySyncModeTransition = function(nextMode)
+    local mode = normalizeSyncMode(nextMode)
+    if not mode then
+        return false, "invalid mode"
+    end
+    local prevMode = currentSyncMode()
+    if prevMode == mode then
+        return true, "no-op"
+    end
+
+    if mode == "file" then
+        for ownerBeammpID, _ in pairs(persistListSet) do
+            clearProxyDispatchStateForOwner(ownerBeammpID)
+        end
+        local retryIds = {}
+        for requestId, envelope in pairs(retryQueue) do
+            local req = envelope and envelope.request or nil
+            if req and tostring(req.kind) == "proxy" then
+                table.insert(retryIds, requestId)
+            end
+        end
+        for _, requestId in ipairs(retryIds) do
+            local req = retryQueue[requestId] and retryQueue[requestId].request or nil
+            if req then
+                local signature = retrySignature(req)
+                if signature and retryDedupe[signature] == requestId then
+                    retryDedupe[signature] = nil
+                end
+            end
+            retryQueue[requestId] = nil
+        end
+    elseif mode == "proxy" then
+        enqueueOfflinePersistOwnersForProxy()
+        tryDrainOfflineQueue()
+    end
+
+    return true, "changed"
 end
 
 local function ownerQueueCount(ownerBeammpID)
@@ -226,6 +364,15 @@ local function queueSyncItems(ownerBeammpID, items)
         end
         return tostring(a.slot) < tostring(b.slot)
     end)
+    local cap = maxSyncQueuePerOwner()
+    if #merged > cap then
+        local trimmed = {}
+        for i = 1, cap do
+            table.insert(trimmed, merged[i])
+        end
+        merged = trimmed
+        openCircuitBreaker("sync queue cap reached for owner " .. ownerBeammpID)
+    end
     syncQueue[ownerBeammpID] = merged
     offlineQueue[ownerBeammpID] = true
 end
@@ -272,6 +419,7 @@ end
 
 local function writeTextAtomic(path, text)
     local tmp = path .. ".tmp"
+    local backup = path .. ".bak"
     local f = io.open(tmp, "w")
     if not f then
         return false, "failed to open temp file for writing"
@@ -280,17 +428,57 @@ local function writeTextAtomic(path, text)
     f:flush()
     f:close()
 
-    if FS.Exists(path) then
-        local rmOk, rmErr = FS.Remove(path)
-        if not rmOk then
-            return false, "failed removing old file: " .. tostring(rmErr)
+    local hadExisting = FS.Exists(path)
+    if hadExisting then
+        if FS.Exists(backup) then
+            FS.Remove(backup)
+        end
+        local bakOk, bakErr = FS.Rename(path, backup)
+        if not bakOk then
+            return false, "failed creating backup file: " .. tostring(bakErr)
         end
     end
+
     local mvOk, mvErr = FS.Rename(tmp, path)
     if not mvOk then
+        if hadExisting and FS.Exists(backup) then
+            FS.Rename(backup, path)
+        end
         return false, "failed renaming temp file: " .. tostring(mvErr)
     end
+    if hadExisting and FS.Exists(backup) then
+        FS.Remove(backup)
+    end
     return true, ""
+end
+
+local function probeStorageWritable()
+    if not FS.Exists(DATA_DIR) then
+        return false, "data dir missing"
+    end
+    local probePath = DATA_DIR .. "/.garagemp_write_probe"
+    local ok, err = writeTextAtomic(probePath, tostring(os.time()))
+    if not ok then
+        return false, err
+    end
+    if FS.Exists(probePath) then
+        FS.Remove(probePath)
+    end
+    return true, ""
+end
+
+local function refreshStorageWritable(force)
+    local now = os.time()
+    if not force and (now - lastStorageProbeAt) < 60 then
+        return storageWritable
+    end
+    lastStorageProbeAt = now
+    local ok, err = probeStorageWritable()
+    storageWritable = ok
+    if not ok then
+        log("Storage is not writable:", tostring(err))
+    end
+    return storageWritable
 end
 
 local function ensureDataDir()
@@ -354,6 +542,12 @@ local function loadConfig()
             decoded.settings[k] = v
         end
     end
+    local normalizedMode = normalizeSyncMode(decoded.settings.syncMode)
+    if not normalizedMode then
+        decoded.settings.syncMode = "proxy"
+    else
+        decoded.settings.syncMode = normalizedMode
+    end
     if type(decoded.admins) ~= "table" then
         decoded.admins = {}
     end
@@ -367,12 +561,19 @@ local function loadConfig()
 end
 
 local function saveConfig()
+    if not storageWritable then
+        return false
+    end
     config.admins = setToArray(adminSet)
     config.persistList = setToArray(persistListSet)
     local encoded = Util.JsonEncode(config)
     local ok, err = writeTextAtomic(CONFIG_PATH, encoded)
     if not ok then
         log("Failed to save config:", err)
+        if string.find(tostring(err), "open temp file", 1, true) then
+            storageWritable = false
+            openCircuitBreaker("storage not writable")
+        end
     else
         configDirty = false
     end
@@ -384,6 +585,9 @@ local function vehiclesPath(beammpID)
 end
 
 local function savePlayerVehicles(beammpID)
+    if not storageWritable then
+        return false
+    end
     local payload = {
         beammpID = tostring(beammpID),
         lastUpdated = os.time(),
@@ -392,6 +596,10 @@ local function savePlayerVehicles(beammpID)
     local ok, err = writeTextAtomic(vehiclesPath(beammpID), Util.JsonEncode(payload))
     if not ok then
         log("Failed saving vehicles for", beammpID, err)
+        if string.find(tostring(err), "open temp file", 1, true) then
+            storageWritable = false
+            openCircuitBreaker("storage not writable")
+        end
     else
         dirtyOwners[tostring(beammpID)] = nil
     end
@@ -497,6 +705,7 @@ local function upsertVehicle(ownerBeammpID, vehicle)
         if key ~= "" and existingKey == key then
             list[idx] = vehicle
             trimOwnerVehicles(ownerBeammpID, "upsert-update")
+            markOwnerDirty(ownerBeammpID)
             return
         end
     end
@@ -611,6 +820,152 @@ local function nowSec()
     return os.time()
 end
 
+local function joinReadyDelaySec()
+    local n = tonumber(config.settings.joinReadyDelaySec) or 8
+    if n < 0 then
+        n = 0
+    end
+    return math.floor(n)
+end
+
+local function ownerDispatchCooldownSec()
+    local n = tonumber(config.settings.ownerDispatchCooldownSec) or 3
+    if n < 0 then
+        n = 0
+    end
+    return math.floor(n)
+end
+
+maxSyncQueuePerOwner = function()
+    local n = tonumber(config.settings.maxSyncQueuePerOwner) or 64
+    if n < 1 then
+        n = 1
+    end
+    return math.floor(n)
+end
+
+local function maxRetryQueueSize()
+    local n = tonumber(config.settings.maxRetryQueueSize) or 1024
+    if n < 16 then
+        n = 16
+    end
+    return math.floor(n)
+end
+
+local function maxPendingRequestsPerOwner()
+    local n = tonumber(config.settings.maxPendingRequestsPerOwner) or 24
+    if n < 1 then
+        n = 1
+    end
+    return math.floor(n)
+end
+
+local function spawnRequestTimeoutSec()
+    local n = tonumber(config.settings.spawnRequestTimeoutSec) or 25
+    if n < 5 then
+        n = 5
+    end
+    return math.floor(n)
+end
+
+local function removeRequestTimeoutSec()
+    local n = tonumber(config.settings.removeRequestTimeoutSec) or 20
+    if n < 5 then
+        n = 5
+    end
+    return math.floor(n)
+end
+
+local function stateCompactionIntervalSec()
+    local n = tonumber(config.settings.stateCompactionIntervalSec) or 60
+    if n < 10 then
+        n = 10
+    end
+    return math.floor(n)
+end
+
+local function circuitBreakerEnabled()
+    return config.settings.enableCircuitBreaker ~= false
+end
+
+local function circuitBreakerCooldownSec()
+    local n = tonumber(config.settings.circuitBreakerCooldownSec) or 10
+    if n < 1 then
+        n = 1
+    end
+    return math.floor(n)
+end
+
+local function setOwnerState(ownerBeammpID, state)
+    ownerState[tostring(ownerBeammpID)] = tostring(state)
+end
+
+local function isCircuitBreakerOpen()
+    return circuitBreakerEnabled() and nowSec() < circuitBreakerUntil
+end
+
+openCircuitBreaker = function(reason)
+    if not circuitBreakerEnabled() then
+        return
+    end
+    circuitBreakerUntil = nowSec() + circuitBreakerCooldownSec()
+    log("Circuit breaker open until", tostring(circuitBreakerUntil), "reason", tostring(reason or "safety"))
+end
+
+local function retrySignature(request)
+    if type(request) ~= "table" then
+        return nil
+    end
+    local parts = {
+        tostring(request.kind or ""),
+        tostring(request.ownerBeammpID or ""),
+        tostring(request.hostPid or ""),
+    }
+    for _, item in ipairs(request.items or {}) do
+        table.insert(parts, tostring(item.slot or ""))
+    end
+    return table.concat(parts, "|")
+end
+
+local function ownerPendingRequestCount(ownerBeammpID)
+    ownerBeammpID = tostring(ownerBeammpID)
+    local n = 0
+    for _, req in pairs(pendingRequests) do
+        if tostring(req.ownerBeammpID) == ownerBeammpID then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function ownerHasInFlight(ownerBeammpID)
+    ownerBeammpID = tostring(ownerBeammpID)
+    for _, req in pairs(pendingRequests) do
+        if tostring(req.ownerBeammpID) == ownerBeammpID then
+            return true
+        end
+    end
+    for _, envelope in pairs(retryQueue) do
+        local req = envelope and envelope.request or nil
+        if req and tostring(req.ownerBeammpID) == ownerBeammpID then
+            return true
+        end
+    end
+    return false
+end
+
+local function isPlayerReady(pid)
+    pid = normalizePid(pid)
+    if not pid then
+        return false
+    end
+    if not MP.IsPlayerConnected(pid) then
+        return false
+    end
+    local readyAt = playerJoinReadyAt[pid] or 0
+    return nowSec() >= readyAt
+end
+
 local function retryBaseDelaySec()
     local baseMs = tonumber(config.settings.retryBaseDelayMs) or 1500
     local sec = math.floor(baseMs / 1000)
@@ -680,6 +1035,7 @@ local function sendProxyRemoveForOwner(ownerBeammpID)
             hostPid = hostPid,
             items = items,
             ts = nowSec(),
+            sentAt = nowSec(),
             retries = 0,
         }
         pendingRemoveRequests[requestId] = req
@@ -722,6 +1078,135 @@ local function removeProxyVehiclesForOwner(ownerBeammpID)
     proxyAssignments[tostring(ownerBeammpID)] = {}
 end
 
+local function clearOwnerRuntimeState(ownerBeammpID, options)
+    ownerBeammpID = tostring(ownerBeammpID)
+    options = options or {}
+
+    if options.removeProxies ~= false then
+        removeProxyVehiclesForOwner(ownerBeammpID)
+    else
+        clearOwnerProxyAssignments(ownerBeammpID)
+    end
+
+    syncQueue[ownerBeammpID] = nil
+    offlineQueue[ownerBeammpID] = nil
+    pendingRestore[ownerBeammpID] = nil
+
+    local pendingIds = {}
+    for requestId, req in pairs(pendingRequests) do
+        if tostring(req.ownerBeammpID) == ownerBeammpID then
+            table.insert(pendingIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(pendingIds) do
+        local req = pendingRequests[requestId]
+        if req then
+            releaseSlots(req.hostPid, req.reservedSlots or #(req.items or {}))
+        end
+        pendingRequests[requestId] = nil
+    end
+
+    local retryIds = {}
+    for requestId, envelope in pairs(retryQueue) do
+        local req = envelope and envelope.request or nil
+        if req and tostring(req.ownerBeammpID) == ownerBeammpID then
+            table.insert(retryIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(retryIds) do
+        local req = retryQueue[requestId] and retryQueue[requestId].request or nil
+        if req then
+            local signature = retrySignature(req)
+            if signature and retryDedupe[signature] == requestId then
+                retryDedupe[signature] = nil
+            end
+        end
+        retryQueue[requestId] = nil
+    end
+
+    local pendingRemoveIds = {}
+    for requestId, req in pairs(pendingRemoveRequests) do
+        if tostring(req.ownerBeammpID) == ownerBeammpID then
+            table.insert(pendingRemoveIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(pendingRemoveIds) do
+        pendingRemoveRequests[requestId] = nil
+    end
+
+    local removeRetryIds = {}
+    for requestId, envelope in pairs(removeRetryQueue) do
+        local req = envelope and envelope.request or nil
+        if req and tostring(req.ownerBeammpID) == ownerBeammpID then
+            table.insert(removeRetryIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(removeRetryIds) do
+        removeRetryQueue[requestId] = nil
+    end
+
+    ownerState[ownerBeammpID] = nil
+    ownerNextDispatchAt[ownerBeammpID] = nil
+
+    if options.clearSaved then
+        savedVehicles[ownerBeammpID] = nil
+        dirtyOwners[ownerBeammpID] = nil
+    end
+end
+
+local function compactRuntimeState(now)
+    now = tonumber(now) or nowSec()
+    local interval = stateCompactionIntervalSec()
+    if (now - lastStateCompactionAt) < interval then
+        return
+    end
+    lastStateCompactionAt = now
+
+    for ownerBeammpID, assignments in pairs(proxyAssignments) do
+        if type(assignments) ~= "table" or #assignments == 0 then
+            proxyAssignments[ownerBeammpID] = nil
+        end
+    end
+
+    for ownerBeammpID, _ in pairs(ownerState) do
+        if not persistListSet[ownerBeammpID]
+            and not offlineQueue[ownerBeammpID]
+            and not pendingRestore[ownerBeammpID]
+            and ownerQueueCount(ownerBeammpID) == 0
+            and not ownerHasInFlight(ownerBeammpID) then
+            ownerState[ownerBeammpID] = nil
+        end
+    end
+
+    for ownerBeammpID, nextAllowed in pairs(ownerNextDispatchAt) do
+        local nextTs = tonumber(nextAllowed) or 0
+        if (now - nextTs) > interval
+            and not offlineQueue[ownerBeammpID]
+            and not pendingRestore[ownerBeammpID]
+            and ownerQueueCount(ownerBeammpID) == 0 then
+            ownerNextDispatchAt[ownerBeammpID] = nil
+        end
+    end
+
+    for pid, _ in pairs(playerJoinReadyAt) do
+        if not MP.IsPlayerConnected(pid) then
+            playerJoinReadyAt[pid] = nil
+        end
+    end
+
+    for pid, _ in pairs(playerToBeammpID) do
+        if not MP.IsPlayerConnected(pid) then
+            playerToBeammpID[pid] = nil
+        end
+    end
+
+    for pid, reserved in pairs(pendingReservations) do
+        if (tonumber(reserved) or 0) <= 0 or not MP.IsPlayerConnected(pid) then
+            pendingReservations[pid] = nil
+        end
+    end
+end
+
 local function onRemoveProxyComplete(senderPid, rawData)
     local ack = parseAckPayload(rawData)
     if not ack then
@@ -745,7 +1230,9 @@ local function scheduleRetry(request, reason)
         return
     end
     local retries = tonumber(request.retries) or 0
-    if retries >= maxSpawnRetries() then
+    local reasonText = string.lower(tostring(reason or ""))
+    local isReadinessReason = string.find(reasonText, "not ready", 1, true) ~= nil or string.find(reasonText, "hasn't joined", 1, true) ~= nil
+    if (not isReadinessReason) and retries >= maxSpawnRetries() then
         log("Retry limit reached for", request.kind, "owner", tostring(request.ownerBeammpID), "reason:", tostring(reason))
         if request.kind == "restore" then
             pendingRestore[tostring(request.ownerBeammpID)] = nil
@@ -762,13 +1249,33 @@ local function scheduleRetry(request, reason)
         ownerBeammpID = tostring(request.ownerBeammpID),
         hostPid = request.hostPid,
         items = request.items,
-        retries = retries + 1,
+        retries = isReadinessReason and retries or (retries + 1),
         ts = nowSec(),
     }
+
+    local pendingCount = 0
+    for _, _ in pairs(retryQueue) do
+        pendingCount = pendingCount + 1
+    end
+    if pendingCount >= maxRetryQueueSize() then
+        openCircuitBreaker("retry queue cap reached")
+        queueSyncItems(nextReq.ownerBeammpID, nextReq.items)
+        queueOwnerForLater(nextReq.ownerBeammpID)
+        return
+    end
+
+    local signature = retrySignature(nextReq)
+    if signature and retryDedupe[signature] then
+        return
+    end
+
     retryQueue[nextReq.requestId] = {
-        dueAt = nowSec() + retryDelaySec(nextReq.retries),
+        dueAt = nowSec() + (isReadinessReason and math.max(retryBaseDelaySec(), joinReadyDelaySec()) or retryDelaySec(nextReq.retries)),
         request = nextReq,
     }
+    if signature then
+        retryDedupe[signature] = nextReq.requestId
+    end
     log("Scheduled spawn retry", nextReq.requestId, "kind", nextReq.kind, "owner", nextReq.ownerBeammpID, "attempt", nextReq.retries, "reason", tostring(reason))
 end
 
@@ -778,10 +1285,52 @@ local function sendSpawnBatch(request)
         return false
     end
 
+    local ownerBeammpID = tostring(request.ownerBeammpID)
+    if request.kind == "proxy" and not isProxyMode() then
+        queueSyncItems(ownerBeammpID, request.items)
+        queueOwnerForLater(ownerBeammpID)
+        return false
+    end
+    if isCircuitBreakerOpen() then
+        if request.kind == "proxy" then
+            queueSyncItems(ownerBeammpID, request.items)
+            queueOwnerForLater(ownerBeammpID)
+        end
+        return false
+    end
+
+    local nextAllowed = ownerNextDispatchAt[ownerBeammpID] or 0
+    if nowSec() < nextAllowed then
+        if request.kind == "proxy" then
+            queueSyncItems(ownerBeammpID, request.items)
+            queueOwnerForLater(ownerBeammpID)
+        end
+        return false
+    end
+
+    if ownerPendingRequestCount(ownerBeammpID) >= maxPendingRequestsPerOwner() then
+        openCircuitBreaker("pending request cap for owner " .. ownerBeammpID)
+        if request.kind == "proxy" then
+            queueSyncItems(ownerBeammpID, request.items)
+            queueOwnerForLater(ownerBeammpID)
+        end
+        return false
+    end
+
+    if not isPlayerReady(request.hostPid) then
+        if request.kind == "proxy" then
+            queueSyncItems(ownerBeammpID, request.items)
+            queueOwnerForLater(ownerBeammpID)
+        end
+        scheduleRetry(request, "target player not ready")
+        return false
+    end
+
     local available = availableSlotsForPid(request.hostPid)
     if available <= 0 then
         if request.kind == "proxy" then
             queueSyncItems(request.ownerBeammpID, request.items)
+            ownerNextDispatchAt[ownerBeammpID] = nowSec() + ownerDispatchCooldownSec()
             log("No host capacity for proxy dispatch; queued", totalItems, "owner", tostring(request.ownerBeammpID), "host", tostring(request.hostPid))
             return false
         end
@@ -815,7 +1364,10 @@ local function sendSpawnBatch(request)
 
     reserveSlots(request.hostPid, totalItems)
     request.reservedSlots = totalItems
+    request.sentAt = nowSec()
     pendingRequests[request.requestId] = request
+    setOwnerState(ownerBeammpID, request.kind == "restore" and "restoring" or "proxying")
+    ownerNextDispatchAt[ownerBeammpID] = nowSec() + ownerDispatchCooldownSec()
     local payload = {
         requestId = request.requestId,
         kind = request.kind,
@@ -836,6 +1388,53 @@ end
 
 local function onRetryTick()
     local now = nowSec()
+
+    local staleSpawnIds = {}
+    local spawnTimeout = spawnRequestTimeoutSec()
+    for requestId, req in pairs(pendingRequests) do
+        local sentAt = tonumber(req.sentAt or req.ts) or now
+        if (now - sentAt) >= spawnTimeout then
+            table.insert(staleSpawnIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(staleSpawnIds) do
+        local req = pendingRequests[requestId]
+        pendingRequests[requestId] = nil
+        if req then
+            releaseSlots(req.hostPid, req.reservedSlots or #(req.items or {}))
+            scheduleRetry(req, "spawn ack timeout")
+            log("Expired stale spawn request", tostring(requestId), "owner", tostring(req.ownerBeammpID), "kind", tostring(req.kind))
+        end
+    end
+
+    local staleRemoveIds = {}
+    local removeTimeout = removeRequestTimeoutSec()
+    for requestId, req in pairs(pendingRemoveRequests) do
+        local sentAt = tonumber(req.sentAt or req.ts) or now
+        if (now - sentAt) >= removeTimeout then
+            table.insert(staleRemoveIds, requestId)
+        end
+    end
+    for _, requestId in ipairs(staleRemoveIds) do
+        local req = pendingRemoveRequests[requestId]
+        pendingRemoveRequests[requestId] = nil
+        if req and req.retries < maxRemoveRetries() then
+            local nextReq = {
+                requestId = nextRequestId(),
+                ownerBeammpID = req.ownerBeammpID,
+                hostPid = req.hostPid,
+                items = req.items,
+                ts = now,
+                retries = req.retries + 1,
+            }
+            removeRetryQueue[nextReq.requestId] = {
+                dueAt = now + retryDelaySec(nextReq.retries),
+                request = nextReq,
+            }
+            log("Expired stale remove request", tostring(requestId), "owner", tostring(req.ownerBeammpID), "retry", tostring(nextReq.requestId))
+        end
+    end
+
     local dueIds = {}
     for requestId, envelope in pairs(retryQueue) do
         if envelope.dueAt <= now then
@@ -848,9 +1447,26 @@ local function onRetryTick()
         retryQueue[requestId] = nil
         if envelope and envelope.request then
             local req = envelope.request
+            if req.kind == "proxy" and not isProxyMode() then
+                local signature = retrySignature(req)
+                if signature and retryDedupe[signature] == requestId then
+                    retryDedupe[signature] = nil
+                end
+                queueSyncItems(req.ownerBeammpID, req.items)
+                queueOwnerForLater(req.ownerBeammpID)
+                goto continue_retry
+            end
+            local signature = retrySignature(req)
+            if signature and retryDedupe[signature] == requestId then
+                retryDedupe[signature] = nil
+            end
             if MP.IsPlayerConnected(req.hostPid) then
-                if not sendSpawnBatch(req) and req.kind == "proxy" then
-                    queueOwnerForLater(req.ownerBeammpID)
+                if isPlayerReady(req.hostPid) then
+                    if not sendSpawnBatch(req) and req.kind == "proxy" then
+                        queueOwnerForLater(req.ownerBeammpID)
+                    end
+                else
+                    scheduleRetry(req, "target player not ready")
                 end
             else
                 if req.kind == "restore" then
@@ -861,6 +1477,7 @@ local function onRetryTick()
                 end
             end
         end
+        ::continue_retry::
     end
 
     local dueRemoveIds = {}
@@ -881,6 +1498,7 @@ local function onRetryTick()
                 items = req.items,
             })
             if ok then
+                req.sentAt = nowSec()
                 pendingRemoveRequests[req.requestId] = req
                 log("Dispatched remove retry", req.requestId, "owner", req.ownerBeammpID, "host", req.hostPid)
             else
@@ -906,12 +1524,27 @@ local function onRetryTick()
     end
 
     tryDrainOfflineQueue()
+    compactRuntimeState(now)
 end
 
 local function spawnOwnerOnHosts(ownerBeammpID, excludePid, options)
     ownerBeammpID = tostring(ownerBeammpID)
+    if not isProxyMode() then
+        setOwnerState(ownerBeammpID, "file-only")
+        return
+    end
     options = options or {}
     local rebuild = options.rebuild ~= false
+
+    if ownerHasInFlight(ownerBeammpID) and not options.force then
+        return
+    end
+
+    local ownerPidOnline = findOnlinePidByBeammpID(ownerBeammpID)
+    if ownerPidOnline and not options.allowOwnerOnline then
+        queueOwnerForLater(ownerBeammpID)
+        return
+    end
 
     local sourceItems = {}
     if rebuild then
@@ -950,6 +1583,20 @@ local function spawnOwnerOnHosts(ownerBeammpID, excludePid, options)
     local hostSlots = {}
     for _, hostPid in ipairs(hosts) do
         hostSlots[hostPid] = availableSlotsForPid(hostPid)
+    end
+
+    local totalAvailableSlots = 0
+    for _, hostPid in ipairs(hosts) do
+        totalAvailableSlots = totalAvailableSlots + (hostSlots[hostPid] or 0)
+    end
+
+    if totalAvailableSlots <= 0 then
+        replaceSyncQueue(ownerBeammpID, sourceItems)
+        queueOwnerForLater(ownerBeammpID)
+        setOwnerState(ownerBeammpID, "file-fallback")
+        ownerNextDispatchAt[ownerBeammpID] = nowSec() + math.max(ownerDispatchCooldownSec(), joinReadyDelaySec())
+        log("No host capacity for owner", ownerBeammpID, "keeping file-backed state with queued proxies", #sourceItems)
+        return
     end
 
     local batches = {}
@@ -1007,7 +1654,7 @@ local function spawnOwnerOnHosts(ownerBeammpID, excludePid, options)
     log("Assigned owner", ownerBeammpID, "proxied", dispatched, "queued", ownerQueueCount(ownerBeammpID), "hosts", #hosts)
 end
 
-local function findOnlinePidByBeammpID(beammpID)
+findOnlinePidByBeammpID = function(beammpID)
     for pid, bid in pairs(playerToBeammpID) do
         if tostring(bid) == tostring(beammpID) and MP.IsPlayerConnected(pid) then
             return pid
@@ -1063,8 +1710,21 @@ local function restoreOwnerVehicles(pid, ownerBeammpID)
 end
 
 tryDrainOfflineQueue = function()
+    if not isProxyMode() then
+        return
+    end
     for ownerBeammpID, queued in pairs(offlineQueue) do
         if queued then
+            if ownerHasInFlight(ownerBeammpID) then
+                goto continue
+            end
+            local nextAllowed = ownerNextDispatchAt[tostring(ownerBeammpID)] or 0
+            if nowSec() < nextAllowed then
+                goto continue
+            end
+            if pendingRestore[tostring(ownerBeammpID)] then
+                goto continue
+            end
             local ownerPid = findOnlinePidByBeammpID(ownerBeammpID)
             if ownerPid then
                 offlineQueue[ownerBeammpID] = nil
@@ -1077,6 +1737,7 @@ tryDrainOfflineQueue = function()
                 end
             end
         end
+        ::continue::
     end
 end
 
@@ -1134,6 +1795,7 @@ local function onSpawnComplete(senderPid, rawData)
     end
 
     local failedItems = {}
+    local validatedSuccessBySlot = {}
     if type(ack.results) == "table" then
         for _, item in ipairs(ack.results) do
             local success = item.success == true
@@ -1141,6 +1803,7 @@ local function onSpawnComplete(senderPid, rawData)
             if success and not hasVehicle(senderPid, hostVid) then
                 success = false
             end
+            validatedSuccessBySlot[tostring(item.slot)] = success
             if success and req.kind == "proxy" then
                 local slot = normalizePid(item.slot) or item.slot
                 table.insert(proxyAssignments[ownerBeammpID], {
@@ -1194,7 +1857,7 @@ local function onSpawnComplete(senderPid, rawData)
         if type(ack.results) == "table" then
             local list = savedVehicles[ownerBeammpID] or {}
             for _, item in ipairs(ack.results) do
-                if item.success == true then
+                if validatedSuccessBySlot[tostring(item.slot)] == true then
                     local original = getRequestItemBySlot(req.items, item.slot)
                     local slot = tonumber(original and original.slot or item.slot)
                     if slot and list[slot] and list[slot].meta then
@@ -1206,12 +1869,15 @@ local function onSpawnComplete(senderPid, rawData)
             markOwnerDirty(ownerBeammpID)
         end
         pendingRestore[ownerBeammpID] = nil
+        setOwnerState(ownerBeammpID, "online")
     end
     if req.kind == "proxy" then
         if ownerQueueCount(ownerBeammpID) > 0 then
             queueOwnerForLater(ownerBeammpID)
+            setOwnerState(ownerBeammpID, "proxying")
         else
             offlineQueue[ownerBeammpID] = nil
+            setOwnerState(ownerBeammpID, "idle")
         end
     end
     pendingRequests[tostring(ack.requestId)] = nil
@@ -1219,18 +1885,22 @@ end
 
 local function onAutoSave()
     onRetryTick()
+    if not storageWritable then
+        refreshStorageWritable(false)
+    end
     saveAll()
 end
 
 local function onInit()
     log("Starting GarageMP")
     ensureDataDir()
+    refreshStorageWritable(true)
     loadConfig()
     loadAllPlayerVehicles()
     MP.RegisterEvent(AUTOSAVE_EVENT, "GarageMP_onAutoSave")
     MP.CreateEventTimer(AUTOSAVE_EVENT, tonumber(config.settings.autoSaveIntervalMs) or 300000)
     MP.CreateEventTimer(RETRY_EVENT, 1000)
-    log("Initialized with", tostring(#setToArray(persistListSet)), "persisted owners")
+    log("Initialized with", tostring(#setToArray(persistListSet)), "persisted owners", "storageWritable", tostring(storageWritable))
 end
 
 local function onShutdown()
@@ -1247,6 +1917,10 @@ local function onPlayerJoin(pid)
         return
     end
 
+    playerJoinReadyAt[pid] = nowSec() + joinReadyDelaySec()
+    setOwnerState(bid, "joining")
+    ownerNextDispatchAt[tostring(bid)] = nowSec() + 1
+
     if isPersistEnabled(bid) then
         restoreOwnerVehicles(pid, bid)
     end
@@ -1261,6 +1935,7 @@ local function onPlayerDisconnect(pid)
     end
 
     pendingReservations[pid] = nil
+    playerJoinReadyAt[pid] = nil
     local droppedRequestIds = {}
     for requestId, req in pairs(pendingRequests) do
         if req.hostPid == pid then
@@ -1271,14 +1946,41 @@ local function onPlayerDisconnect(pid)
         local req = pendingRequests[requestId]
         pendingRequests[requestId] = nil
         if req then
+            releaseSlots(req.hostPid, req.reservedSlots or #(req.items or {}))
             scheduleRetry(req, "host disconnected before spawn ack")
         end
     end
 
+    local droppedRemovePending = {}
+    for requestId, req in pairs(pendingRemoveRequests) do
+        if req.hostPid == pid then
+            table.insert(droppedRemovePending, requestId)
+        end
+    end
+    for _, requestId in ipairs(droppedRemovePending) do
+        pendingRemoveRequests[requestId] = nil
+    end
+
+    local droppedRemoveRetry = {}
+    for requestId, envelope in pairs(removeRetryQueue) do
+        local req = envelope and envelope.request or nil
+        if req and req.hostPid == pid then
+            table.insert(droppedRemoveRetry, requestId)
+        end
+    end
+    for _, requestId in ipairs(droppedRemoveRetry) do
+        removeRetryQueue[requestId] = nil
+    end
+
     local bid = playerToBeammpID[pid] or getBeammpID(pid)
     if bid and isPersistEnabled(bid) then
+        setOwnerState(bid, "offline")
         snapshotOwnerVehicles(pid, bid)
-        spawnOwnerOnHosts(bid, pid)
+        if isProxyMode() then
+            spawnOwnerOnHosts(bid, pid)
+        else
+            clearProxyDispatchStateForOwner(bid)
+        end
     end
 
     local affectedOwners = {}
@@ -1296,8 +1998,10 @@ local function onPlayerDisconnect(pid)
         local ownerPid = findOnlinePidByBeammpID(ownerBeammpID)
         if ownerPid then
             restoreOwnerVehicles(ownerPid, ownerBeammpID)
-        else
+        elseif isProxyMode() then
             spawnOwnerOnHosts(ownerBeammpID, pid)
+        else
+            setOwnerState(ownerBeammpID, "file-only")
         end
     end
 
@@ -1381,13 +2085,14 @@ local function onVehicleReset(pid, vid, data)
             v.pos = decoded.pos or v.pos
             v.rot = decoded.rot or v.rot
             v.meta.timestamp = os.time()
+            markOwnerDirty(bid)
             break
         end
     end
 end
 
 local function sendHelp(pid)
-    MP.SendChatMessage(pid, "GarageMP commands: /garagemp help|status|limits|add|remove|list|save|clear|addadmin|removeadmin|info|proxyclear|setup")
+    MP.SendChatMessage(pid, "GarageMP commands: /garagemp help|status|limits|add|remove|list|save|clear|addadmin|removeadmin|info|proxyclear|syncmode|setup")
 end
 
 local function resolveCommand(message)
@@ -1487,7 +2192,57 @@ local function onChatMessage(pid, name, message)
         for _, items in pairs(syncQueue) do
             queuedVehicles = queuedVehicles + #items
         end
-        MP.SendChatMessage(pid, "GarageMP info: owners=" .. ownerCount .. ", proxies=" .. activeProxy .. ", queuedOwners=" .. queued .. ", queuedVehicles=" .. queuedVehicles .. ", cap=" .. tostring(effectivePerPlayerCap()))
+        local pendingCount = 0
+        for _, _ in pairs(pendingRequests) do
+            pendingCount = pendingCount + 1
+        end
+        local retryCount = 0
+        for _, _ in pairs(retryQueue) do
+            retryCount = retryCount + 1
+        end
+        local pendingRemoveCount = 0
+        for _, _ in pairs(pendingRemoveRequests) do
+            pendingRemoveCount = pendingRemoveCount + 1
+        end
+        local removeRetryCount = 0
+        for _, _ in pairs(removeRetryQueue) do
+            removeRetryCount = removeRetryCount + 1
+        end
+        local reservedSlots = 0
+        for _, n in pairs(pendingReservations) do
+            reservedSlots = reservedSlots + (tonumber(n) or 0)
+        end
+        MP.SendChatMessage(pid, "GarageMP info: mode=" .. currentSyncMode() .. ", owners=" .. ownerCount .. ", proxies=" .. activeProxy .. ", queuedOwners=" .. queued .. ", queuedVehicles=" .. queuedVehicles .. ", pending=" .. pendingCount .. ", retries=" .. retryCount .. ", pendingRemoves=" .. pendingRemoveCount .. ", removeRetries=" .. removeRetryCount .. ", reserved=" .. reservedSlots .. ", breaker=" .. tostring(isCircuitBreakerOpen()) .. ", cap=" .. tostring(effectivePerPlayerCap()))
+        return 1
+    elseif cmd == "syncmode" then
+        local requested = string.lower(tostring(args[2] or "status"))
+        if requested == "status" then
+            MP.SendChatMessage(pid, "GarageMP sync mode: " .. currentSyncMode())
+            return 1
+        end
+        local mode = normalizeSyncMode(requested)
+        if not mode then
+            MP.SendChatMessage(pid, "GarageMP: invalid mode. Use proxy|file|status")
+            return 1
+        end
+        local previous = currentSyncMode()
+        config.settings.syncMode = mode
+        markConfigDirty()
+        local changed, reason = applySyncModeTransition(mode)
+        if not changed then
+            config.settings.syncMode = previous
+            MP.SendChatMessage(pid, "GarageMP: failed to apply mode: " .. tostring(reason))
+            return 1
+        end
+        local saved = saveConfig()
+        if reason == "no-op" then
+            MP.SendChatMessage(pid, "GarageMP sync mode already " .. mode)
+        elseif not saved then
+            MP.SendChatMessage(pid, "GarageMP sync mode changed to " .. mode .. " (warning: failed to persist config)")
+        else
+            MP.SendChatMessage(pid, "GarageMP sync mode changed to " .. mode)
+        end
+        log("Admin command syncmode by", tostring(name), "mode", tostring(mode), "previous", tostring(previous))
         return 1
     elseif cmd == "add" or cmd == "remove" or cmd == "clear" or cmd == "addadmin" or cmd == "removeadmin" or cmd == "proxyclear" then
         local targetName = args[2]
@@ -1518,6 +2273,7 @@ local function onChatMessage(pid, name, message)
             MP.SendChatMessage(pid, "GarageMP: persistence enabled for " .. resolvedName)
         elseif cmd == "remove" then
             persistListSet[targetBid] = nil
+            clearOwnerRuntimeState(targetBid, { removeProxies = true, clearSaved = false })
             markConfigDirty()
             saveConfig()
             MP.SendChatMessage(pid, "GarageMP: persistence disabled for " .. resolvedName)

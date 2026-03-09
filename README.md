@@ -39,6 +39,7 @@ GarageMP is a BeamMP server/client mod that persists selected players' vehicles 
 - `/garagemp removeadmin <playerName>`
 - `/garagemp info`
 - `/garagemp proxyclear <playerName|beammpID>`
+- `/garagemp syncmode <proxy|file|status>`
 
 
 ## Update Existing Installation
@@ -63,6 +64,7 @@ Key settings:
 - `maxVehiclesPerPlayer`
 - `serverMaxCarsPerPlayer` (set this to your BeamMP `MaxCars` value)
 - `commandPrefix`
+- `syncMode` (`proxy` to keep offline owners live via hosts, `file` to disable proxy syncing)
 - `excludeGuestsAsHosts`
 - `spawnMaxRetries`
 - `retryBaseDelayMs`
