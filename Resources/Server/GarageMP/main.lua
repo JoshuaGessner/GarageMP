@@ -424,8 +424,18 @@ local function writeTextAtomic(path, text)
     if not f then
         return false, "failed to open temp file for writing"
     end
-    f:write(text)
-    f:flush()
+    local wOk, wErr = f:write(text)
+    if not wOk then
+        f:close()
+        if FS.Exists(tmp) then FS.Remove(tmp) end
+        return false, "write failed: " .. tostring(wErr)
+    end
+    local flOk, flErr = f:flush()
+    if not flOk then
+        f:close()
+        if FS.Exists(tmp) then FS.Remove(tmp) end
+        return false, "flush failed: " .. tostring(flErr)
+    end
     f:close()
 
     local hadExisting = FS.Exists(path)
@@ -469,10 +479,12 @@ end
 
 local function refreshStorageWritable(force)
     local now = os.time()
-    if not force and (now - lastStorageProbeAt) < 60 then
+    -- Always force re-probe when storage is currently not writable
+    if not force and storageWritable and (now - lastStorageProbeAt) < 60 then
         return storageWritable
     end
     lastStorageProbeAt = now
+    ensureDataDir()
     local ok, err = probeStorageWritable()
     storageWritable = ok
     if not ok then
@@ -732,38 +744,49 @@ local function removeVehicleByOwnerVid(ownerBeammpID, ownerVid)
 end
 
 local function snapshotOwnerVehicles(pid, ownerBeammpID)
+    ownerBeammpID = tostring(ownerBeammpID)
+    local existing = savedVehicles[ownerBeammpID]
+    if type(existing) ~= "table" or #existing == 0 then
+        -- Nothing saved in memory; persist as-is (don't overwrite with empty)
+        replaceSyncQueue(ownerBeammpID, {})
+        savePlayerVehicles(ownerBeammpID)
+        return
+    end
+
+    -- Refresh positions for vehicles we already have, but never replace the list
     local rawVehicles = MP.GetPlayerVehicles(pid)
-    local result = {}
-    local maxVehicles = effectivePerPlayerCap()
-
-    for vid, rawData in pairs(rawVehicles) do
-        if #result >= maxVehicles then
-            break
+    if type(rawVehicles) == "table" then
+        local byVid = {}
+        for vid, rawData in pairs(rawVehicles) do
+            byVid[tostring(normalizePid(vid) or vid)] = rawData
         end
-        local decoded = extractVehicleJson(rawData)
-        if decoded then
-            local posRaw, err = MP.GetPositionRaw(pid, normalizePid(vid) or vid)
-            if type(posRaw) == "table" and err == "" then
-                decoded.pos = posRaw.pos or decoded.pos
-                decoded.rot = posRaw.rot or decoded.rot
-            end
 
-            local vehicle = {
-                jbm = decoded.jbm,
-                vcf = decoded.vcf,
-                pos = decoded.pos,
-                rot = decoded.rot,
-                meta = {
-                    ownerVid = normalizePid(vid) or vid,
-                    ownerPidAtSnapshot = pid,
-                    timestamp = os.time(),
-                },
-            }
-            table.insert(result, vehicle)
+        for _, v in ipairs(existing) do
+            local ownerVid = v.meta and v.meta.ownerVid
+            if ownerVid then
+                local vidKey = tostring(ownerVid)
+                -- Try to refresh position from live data
+                local posRaw, err = MP.GetPositionRaw(pid, normalizePid(ownerVid) or ownerVid)
+                if type(posRaw) == "table" and err == "" then
+                    v.pos = posRaw.pos or v.pos
+                    v.rot = posRaw.rot or v.rot
+                end
+                -- Update config if still available
+                if byVid[vidKey] then
+                    local decoded = extractVehicleJson(byVid[vidKey])
+                    if decoded then
+                        v.jbm = decoded.jbm or v.jbm
+                        v.vcf = decoded.vcf or v.vcf
+                    end
+                end
+                if v.meta then
+                    v.meta.ownerPidAtSnapshot = pid
+                    v.meta.timestamp = os.time()
+                end
+            end
         end
     end
 
-    savedVehicles[tostring(ownerBeammpID)] = result
     replaceSyncQueue(ownerBeammpID, {})
     markOwnerDirty(ownerBeammpID)
     savePlayerVehicles(ownerBeammpID)
@@ -962,7 +985,10 @@ local function isPlayerReady(pid)
     if not MP.IsPlayerConnected(pid) then
         return false
     end
-    local readyAt = playerJoinReadyAt[pid] or 0
+    local readyAt = playerJoinReadyAt[pid]
+    if not readyAt then
+        return false -- client hasn't sent ready event yet
+    end
     return nowSec() >= readyAt
 end
 
@@ -1230,8 +1256,19 @@ local function scheduleRetry(request, reason)
         return
     end
     local retries = tonumber(request.retries) or 0
+    local readinessRetries = tonumber(request.readinessRetries) or 0
     local reasonText = string.lower(tostring(reason or ""))
     local isReadinessReason = string.find(reasonText, "not ready", 1, true) ~= nil or string.find(reasonText, "hasn't joined", 1, true) ~= nil
+    if isReadinessReason and readinessRetries >= 15 then
+        log("Readiness retry limit reached for", request.kind, "owner", tostring(request.ownerBeammpID), "reason:", tostring(reason))
+        if request.kind == "restore" then
+            pendingRestore[tostring(request.ownerBeammpID)] = nil
+        else
+            queueSyncItems(request.ownerBeammpID, request.items)
+            queueOwnerForLater(request.ownerBeammpID)
+        end
+        return
+    end
     if (not isReadinessReason) and retries >= maxSpawnRetries() then
         log("Retry limit reached for", request.kind, "owner", tostring(request.ownerBeammpID), "reason:", tostring(reason))
         if request.kind == "restore" then
@@ -1250,6 +1287,7 @@ local function scheduleRetry(request, reason)
         hostPid = request.hostPid,
         items = request.items,
         retries = isReadinessReason and retries or (retries + 1),
+        readinessRetries = isReadinessReason and (readinessRetries + 1) or readinessRetries,
         ts = nowSec(),
     }
 
@@ -1318,10 +1356,6 @@ local function sendSpawnBatch(request)
     end
 
     if not isPlayerReady(request.hostPid) then
-        if request.kind == "proxy" then
-            queueSyncItems(ownerBeammpID, request.items)
-            queueOwnerForLater(ownerBeammpID)
-        end
         scheduleRetry(request, "target player not ready")
         return false
     end
@@ -1800,8 +1834,8 @@ local function onSpawnComplete(senderPid, rawData)
         for _, item in ipairs(ack.results) do
             local success = item.success == true
             local hostVid = normalizePid(item.hostVid) or item.hostVid
-            if success and not hasVehicle(senderPid, hostVid) then
-                success = false
+            if not success then
+                log("Spawn item failed", "slot", tostring(item.slot), "hostVid", tostring(hostVid), "error", tostring(item.error or "unknown"))
             end
             validatedSuccessBySlot[tostring(item.slot)] = success
             if success and req.kind == "proxy" then
@@ -1917,12 +1951,26 @@ local function onPlayerJoin(pid)
         return
     end
 
-    playerJoinReadyAt[pid] = nowSec() + joinReadyDelaySec()
+    -- Don't set readyAt here — wait for client "ready" event
     setOwnerState(bid, "joining")
     ownerNextDispatchAt[tostring(bid)] = nowSec() + 1
+end
 
-    if isPersistEnabled(bid) then
-        restoreOwnerVehicles(pid, bid)
+local function onClientReady(senderPid, rawData)
+    senderPid = normalizePid(senderPid)
+    if not senderPid then
+        return
+    end
+    -- Client extension has loaded and is ready to receive events
+    if playerJoinReadyAt[senderPid] then
+        return -- already marked ready, ignore duplicate
+    end
+    playerJoinReadyAt[senderPid] = nowSec()
+    log("Client ready received", "pid", senderPid)
+
+    local bid = getBeammpID(senderPid)
+    if bid and isPersistEnabled(bid) then
+        restoreOwnerVehicles(senderPid, bid)
     end
 
     tryDrainOfflineQueue()
@@ -2358,6 +2406,10 @@ function GarageMP_onRemoveProxyComplete(senderPid, rawData)
     return guarded("GarageMP_RemoveProxyComplete", onRemoveProxyComplete, senderPid, rawData)
 end
 
+function GarageMP_onClientReady(senderPid, rawData)
+    return guarded("GarageMP_ClientReady", onClientReady, senderPid, rawData)
+end
+
 function GarageMP_onRetryTick()
     return guarded("GarageMP_RetryTick", onRetryTick)
 end
@@ -2377,4 +2429,5 @@ MP.RegisterEvent("onVehicleReset", "GarageMP_onVehicleReset")
 MP.RegisterEvent("onChatMessage", "GarageMP_onChatMessage")
 MP.RegisterEvent("GarageMP_SpawnComplete", "GarageMP_onSpawnComplete")
 MP.RegisterEvent("GarageMP_RemoveProxyComplete", "GarageMP_onRemoveProxyComplete")
+MP.RegisterEvent("GarageMP_ClientReady", "GarageMP_onClientReady")
 MP.RegisterEvent(RETRY_EVENT, "GarageMP_onRetryTick")
