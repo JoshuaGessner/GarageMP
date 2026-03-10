@@ -65,6 +65,7 @@ local openCircuitBreaker
 local isProxyMode
 local normalizeSyncMode
 local applySyncModeTransition
+local ensureDataDir
 
 local function log(...)
     print(GARAGEMP_PREFIX, ...)
@@ -493,7 +494,7 @@ local function refreshStorageWritable(force)
     return storageWritable
 end
 
-local function ensureDataDir()
+ensureDataDir = function()
     local ok, err = FS.CreateDirectory(DATA_DIR)
     if not ok then
         log("Failed to create data dir:", err)
