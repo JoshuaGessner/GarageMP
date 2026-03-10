@@ -7,7 +7,7 @@ BUILD_DIR="$DIST_DIR/build"
 UPLOAD_ROOT="$BUILD_DIR/GarageMP"
 CLIENT_SRC="$ROOT_DIR/Resources/Client/GarageMP"
 SERVER_SRC="$ROOT_DIR/Resources/Server/GarageMP"
-README_SRC="$ROOT_DIR/README_GarageMP.md"
+README_SRC="$ROOT_DIR/README.md"
 
 CLIENT_ZIP_NAME="GarageMP.zip"
 UPLOAD_ZIP_NAME="GarageMP.zip"

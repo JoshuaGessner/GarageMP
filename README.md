@@ -2,6 +2,8 @@
 
 GarageMP is a BeamMP server/client mod that persists selected players' vehicles across disconnects and server restarts.
 
+This is the canonical project guide. Release packaging also uses this file.
+
 ## Included in This Repository
 
 - `Resources/Server/GarageMP/main.lua`
@@ -59,6 +61,10 @@ Notes:
 - `/garagemp proxyclear <playerName|beammpID>`
 - `/garagemp syncmode <proxy|file|status>`
 
+Optional alias:
+
+- No legacy alias is supported. Use `/garagemp ...` for all commands.
+
 
 ## Update Existing Installation
 
@@ -98,3 +104,4 @@ Key settings:
 BeamMP cannot keep vehicles physically spawned when zero clients are connected. GarageMP persists vehicles and restores/re-hosts them when suitable clients are online.
 
 When there is not enough live vehicle capacity across connected proxy hosts, GarageMP keeps as many vehicles synced as possible and queues the overflow. Queued overflow stays in persisted files and is restored on owner login or when proxy capacity becomes available.
+
