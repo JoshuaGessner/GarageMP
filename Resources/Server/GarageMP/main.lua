@@ -3,6 +3,8 @@ local DATA_DIR = "Resources/Server/GarageMP/data"
 local CONFIG_PATH = DATA_DIR .. "/config.json"
 local AUTOSAVE_EVENT = "GarageMP_AutoSave"
 local RETRY_EVENT = "GarageMP_RetryTick"
+local HEALTH_EVENT = "GarageMP_HealthTick"
+local PLUGIN_VERSION = "2026-03-10-observability1"
 
 local DEFAULT_CONFIG = {
     admins = {},
@@ -50,6 +52,8 @@ local ownerState = {} -- ownerBeammpID -> state string
 local ownerNextDispatchAt = {} -- ownerBeammpID -> epoch sec
 local retryDedupe = {} -- retrySignature -> requestId
 local playerJoinReadyAt = {} -- pid -> epoch sec when safe for client events
+local playerJoinAt = {} -- pid -> epoch sec when join handler ran
+local playerClientReadySeen = {} -- pid -> true once client-ready event observed
 local storageWritable = true
 local lastStorageProbeAt = 0
 local lastStateCompactionAt = 0
@@ -69,6 +73,76 @@ local ensureDataDir
 
 local function log(...)
     print(GARAGEMP_PREFIX, ...)
+end
+
+local function logStartupFingerprint()
+    log("Build fingerprint", "version", PLUGIN_VERSION, "startedAt", tostring(os.date("!%Y-%m-%dT%H:%M:%SZ")))
+end
+
+local function logConfigSnapshot()
+    local s = config.settings or {}
+    log(
+        "Config snapshot",
+        "mode", tostring(s.syncMode),
+        "modCap", tostring(s.maxVehiclesPerPlayer),
+        "serverCap", tostring(s.serverMaxCarsPerPlayer),
+        "joinReadyDelaySec", tostring(s.joinReadyDelaySec),
+        "ownerDispatchCooldownSec", tostring(s.ownerDispatchCooldownSec),
+        "spawnTimeoutSec", tostring(s.spawnRequestTimeoutSec),
+        "removeTimeoutSec", tostring(s.removeRequestTimeoutSec),
+        "retryBaseDelayMs", tostring(s.retryBaseDelayMs)
+    )
+end
+
+local function countEntries(tbl)
+    local n = 0
+    for _, _ in pairs(tbl or {}) do
+        n = n + 1
+    end
+    return n
+end
+
+local function logHealthSummary()
+    local ownerCount = 0
+    for _, enabled in pairs(persistListSet) do
+        if enabled then
+            ownerCount = ownerCount + 1
+        end
+    end
+    local proxies = 0
+    for _, assignments in pairs(proxyAssignments) do
+        proxies = proxies + #assignments
+    end
+    local queuedOwners = 0
+    for _, queued in pairs(offlineQueue) do
+        if queued then
+            queuedOwners = queuedOwners + 1
+        end
+    end
+    local queuedVehicles = 0
+    for _, items in pairs(syncQueue) do
+        queuedVehicles = queuedVehicles + #items
+    end
+    local reserved = 0
+    for _, n in pairs(pendingReservations) do
+        reserved = reserved + (tonumber(n) or 0)
+    end
+
+    log(
+        "Health",
+        "mode", currentSyncMode(),
+        "owners", tostring(ownerCount),
+        "proxies", tostring(proxies),
+        "queuedOwners", tostring(queuedOwners),
+        "queuedVehicles", tostring(queuedVehicles),
+        "pending", tostring(countEntries(pendingRequests)),
+        "retries", tostring(countEntries(retryQueue)),
+        "pendingRemoves", tostring(countEntries(pendingRemoveRequests)),
+        "removeRetries", tostring(countEntries(removeRetryQueue)),
+        "reserved", tostring(reserved),
+        "breaker", tostring(isCircuitBreakerOpen()),
+        "storageWritable", tostring(storageWritable)
+    )
 end
 
 local function normalizePid(pid)
@@ -1221,6 +1295,13 @@ local function compactRuntimeState(now)
         end
     end
 
+    for pid, _ in pairs(playerJoinAt) do
+        if not MP.IsPlayerConnected(pid) then
+            playerJoinAt[pid] = nil
+            playerClientReadySeen[pid] = nil
+        end
+    end
+
     for pid, _ in pairs(playerToBeammpID) do
         if not MP.IsPlayerConnected(pid) then
             playerToBeammpID[pid] = nil
@@ -1243,9 +1324,13 @@ local function onRemoveProxyComplete(senderPid, rawData)
     if requestId == "" then
         return
     end
-    if pendingRemoveRequests[requestId] then
-        pendingRemoveRequests[requestId] = nil
+    local req = pendingRemoveRequests[requestId]
+    if not req then
+        log("Remove ack ignored: unknown request", "requestId", requestId, "senderPid", tostring(senderPid))
+        return
     end
+    pendingRemoveRequests[requestId] = nil
+    log("Remove ack processed", "requestId", requestId, "owner", tostring(req.ownerBeammpID), "host", tostring(senderPid), "removed", tostring(#(ack.removedSlots or {})))
 end
 
 local function queueOwnerForLater(ownerBeammpID)
@@ -1325,6 +1410,7 @@ local function sendSpawnBatch(request)
     end
 
     local ownerBeammpID = tostring(request.ownerBeammpID)
+    log("Dispatch attempt", "requestId", tostring(request.requestId), "kind", tostring(request.kind), "owner", ownerBeammpID, "host", tostring(request.hostPid), "items", tostring(totalItems), "mode", currentSyncMode())
     if request.kind == "proxy" and not isProxyMode() then
         queueSyncItems(ownerBeammpID, request.items)
         queueOwnerForLater(ownerBeammpID)
@@ -1703,10 +1789,12 @@ local function restoreOwnerVehicles(pid, ownerBeammpID)
     ownerBeammpID = tostring(ownerBeammpID)
     trimOwnerVehicles(ownerBeammpID, "restore")
     local vehicles = savedVehicles[ownerBeammpID] or {}
+    log("Restore requested", "owner", ownerBeammpID, "pid", tostring(pid), "saved", tostring(#vehicles), "mode", currentSyncMode())
     removeProxyVehiclesForOwner(ownerBeammpID)
 
     if #vehicles == 0 then
         pendingRestore[ownerBeammpID] = nil
+        log("Restore noop: no saved vehicles", "owner", ownerBeammpID)
         return
     end
 
@@ -1820,6 +1908,7 @@ local function onSpawnComplete(senderPid, rawData)
     end
     local req = pendingRequests[tostring(ack.requestId)]
     if not req then
+        log("Spawn ack ignored: unknown request", "requestId", tostring(ack.requestId), "senderPid", tostring(senderPid))
         return
     end
     releaseSlots(req.hostPid, req.reservedSlots or #(req.items or {}))
@@ -1888,6 +1977,19 @@ local function onSpawnComplete(senderPid, rawData)
         end
     end
 
+    local successCount = 0
+    local failCount = 0
+    if type(ack.results) == "table" then
+        for _, item in ipairs(ack.results) do
+            if validatedSuccessBySlot[tostring(item.slot)] == true then
+                successCount = successCount + 1
+            else
+                failCount = failCount + 1
+            end
+        end
+    end
+    log("Spawn ack processed", "requestId", tostring(ack.requestId), "kind", tostring(req.kind), "owner", tostring(ownerBeammpID), "host", tostring(senderPid), "success", tostring(successCount), "failed", tostring(failCount))
+
     if req.kind == "restore" then
         if type(ack.results) == "table" then
             local list = savedVehicles[ownerBeammpID] or {}
@@ -1932,9 +2034,13 @@ local function onInit()
     refreshStorageWritable(true)
     loadConfig()
     loadAllPlayerVehicles()
+    logStartupFingerprint()
+    logConfigSnapshot()
     MP.RegisterEvent(AUTOSAVE_EVENT, "GarageMP_onAutoSave")
+    MP.RegisterEvent(HEALTH_EVENT, "GarageMP_onHealthTick")
     MP.CreateEventTimer(AUTOSAVE_EVENT, tonumber(config.settings.autoSaveIntervalMs) or 300000)
     MP.CreateEventTimer(RETRY_EVENT, 1000)
+    MP.CreateEventTimer(HEALTH_EVENT, 30000)
     log("Initialized with", tostring(#setToArray(persistListSet)), "persisted owners", "storageWritable", tostring(storageWritable))
 end
 
@@ -1952,9 +2058,14 @@ local function onPlayerJoin(pid)
         return
     end
 
-    -- Don't set readyAt here — wait for client "ready" event
+    local joinedAt = nowSec()
+    playerJoinAt[pid] = joinedAt
+    playerClientReadySeen[pid] = nil
+    -- Fallback readiness: if client-ready event never arrives, restore/proxy can still proceed.
+    playerJoinReadyAt[pid] = joinedAt + joinReadyDelaySec()
     setOwnerState(bid, "joining")
     ownerNextDispatchAt[tostring(bid)] = nowSec() + 1
+    log("Player join", "pid", tostring(pid), "beammpID", tostring(bid), "mode", currentSyncMode(), "fallbackReadyAt", tostring(playerJoinReadyAt[pid]))
 end
 
 local function onClientReady(senderPid, rawData)
@@ -1963,11 +2074,13 @@ local function onClientReady(senderPid, rawData)
         return
     end
     -- Client extension has loaded and is ready to receive events
-    if playerJoinReadyAt[senderPid] then
+    if playerClientReadySeen[senderPid] then
         return -- already marked ready, ignore duplicate
     end
+    playerClientReadySeen[senderPid] = true
     playerJoinReadyAt[senderPid] = nowSec()
-    log("Client ready received", "pid", senderPid)
+    local joinedAt = playerJoinAt[senderPid] or nowSec()
+    log("Client ready received", "pid", senderPid, "joinDelaySec", tostring(nowSec() - joinedAt))
 
     local bid = getBeammpID(senderPid)
     if bid and isPersistEnabled(bid) then
@@ -1984,7 +2097,9 @@ local function onPlayerDisconnect(pid)
     end
 
     pendingReservations[pid] = nil
+    playerJoinAt[pid] = nil
     playerJoinReadyAt[pid] = nil
+    playerClientReadySeen[pid] = nil
     local droppedRequestIds = {}
     for requestId, req in pairs(pendingRequests) do
         if req.hostPid == pid then
@@ -2022,6 +2137,7 @@ local function onPlayerDisconnect(pid)
     end
 
     local bid = playerToBeammpID[pid] or getBeammpID(pid)
+    log("Player disconnect", "pid", tostring(pid), "beammpID", tostring(bid), "mode", currentSyncMode())
     if bid and isPersistEnabled(bid) then
         setOwnerState(bid, "offline")
         snapshotOwnerVehicles(pid, bid)
@@ -2354,6 +2470,10 @@ local function onChatMessage(pid, name, message)
     return 1
 end
 
+local function onHealthTick()
+    logHealthSummary()
+end
+
 local function guarded(handlerName, fn, ...)
     local ok, result = pcall(fn, ...)
     if not ok then
@@ -2417,6 +2537,10 @@ end
 
 function GarageMP_onAutoSave()
     return guarded("GarageMP_AutoSave", onAutoSave)
+end
+
+function GarageMP_onHealthTick()
+    return guarded("GarageMP_HealthTick", onHealthTick)
 end
 
 MP.RegisterEvent("onInit", "GarageMP_onInit")
