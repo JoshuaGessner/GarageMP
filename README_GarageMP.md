@@ -2,7 +2,7 @@
 
 GarageMP is a BeamMP server/client mod that persists selected players' vehicles across disconnects and server restarts.
 
-## Included in This Repository
+## Included in This Release
 
 - `Resources/Server/GarageMP/main.lua`
 - `Resources/Server/GarageMP/data/.gitkeep`
@@ -12,8 +12,8 @@ GarageMP is a BeamMP server/client mod that persists selected players' vehicles 
 ## Install
 
 1. Stop your BeamMP server.
-2. Build `Resources/Client/GarageMP.zip` from `Resources/Client/GarageMP/` (or download a release artifact).
-3. Copy this repository's `Resources/` folder into your server root directory.
+2. Build `Resources/Client/GarageMP.zip` from `Resources/Client/GarageMP/` (or use a release artifact).
+3. Extract/copy files into your server root directory.
 4. Confirm these paths exist:
    - `Resources/Server/GarageMP/main.lua`
    - `Resources/Client/GarageMP.zip`
@@ -23,12 +23,6 @@ Quick local build command:
 
 ```bash
 (cd Resources/Client/GarageMP && zip -rq ../GarageMP.zip . -x "*.DS_Store")
-```
-
-Release package build command:
-
-```bash
-./scripts/package_garagemp.sh
 ```
 
 Notes:
@@ -59,6 +53,9 @@ Notes:
 - `/garagemp proxyclear <playerName|beammpID>`
 - `/garagemp syncmode <proxy|file|status>`
 
+Optional alias:
+
+- No legacy alias is supported. Use `/garagemp ...` for all commands.
 
 ## Update Existing Installation
 
@@ -66,7 +63,7 @@ Notes:
 2. Backup `Resources/Server/GarageMP/data/`.
 3. Replace:
    - `Resources/Server/GarageMP/main.lua`
-   - `Resources/Client/GarageMP.zip` (rebuilt from source or from release)
+   - `Resources/Client/GarageMP.zip`
 4. Keep existing `data/` files.
 5. Start server and validate with `/garagemp info`.
 
@@ -97,4 +94,4 @@ Key settings:
 
 BeamMP cannot keep vehicles physically spawned when zero clients are connected. GarageMP persists vehicles and restores/re-hosts them when suitable clients are online.
 
-When there is not enough live vehicle capacity across connected proxy hosts, GarageMP keeps as many vehicles synced as possible and queues the overflow. Queued overflow stays in persisted files and is restored on owner login or when proxy capacity becomes available.
+When connected players do not have enough free vehicle slots, GarageMP keeps as many vehicles synced as capacity allows and queues overflow for later sync. Overflow always remains persisted on disk and can restore on owner login.

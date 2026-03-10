@@ -7,13 +7,13 @@
 
 # Build and release artifacts
 dist/
+Resources/Client/GarageMP.zip
+Resources/**/*.zip
+Resources/**/*.sha256
 
 # Development-only project docs and tooling
 PLAN.md
 TODO.md
-README_GarageMP.md
-scripts/
-Resources/Client/GarageMP/
 
 # Temp files
 *.tmp
